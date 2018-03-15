@@ -441,16 +441,16 @@ class Account(metaclass=ElementConstructor):
         self.followers = set()
 
     def __setDataFromJSON__(self, data):
-        data = data['user']
+        data = data['graphql']['user']
         self.id = data['id']
         self.full_name = data['full_name']
         self.profile_pic_url = data['profile_pic_url']
         self.profile_pic_url_hd = data['profile_pic_url_hd']
         self.fb_page = data['connected_fb_page']
         self.biography = data['biography']
-        self.follows_count = data['follows']['count']
-        self.followers_count = data['followed_by']['count']
-        self.media_count = data['media']['count']
+        self.follows_count = data['edge_follow']['count']
+        self.followers_count = data['edge_followed_by']['count']
+        self.media_count = data['edge_owner_to_timeline_media']['count']
         self.is_private = data['is_private']
         self.is_verified = data['is_verified']
         self.country_block = data['country_block']
