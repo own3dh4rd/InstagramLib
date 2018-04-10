@@ -97,37 +97,18 @@ class ExceptionTree:
             continue
 
 
-# Cache class for optimized memory
-class ElementConstructor(type):
-    def __new__(cls, name, classes, fields):
-        fields["__del__"] = ElementConstructor.__custom_del__
-        fields["__str__"] = lambda self: str(
-            self.__getattribute__(self.__primarykey__))
-        fields["__repr__"] = lambda self: str(
-            self.__getattribute__(self.__primarykey__))
-        return type.__new__(cls, name, classes, fields)
-
-    def __custom_del__(self):
-        del self.__cache__[self.__getattribute__(self.__primarykey__)]
-
-    def __call__(cls, key, *args, **kwargs):
-        if not key in cls.__cache__:
-            cls.__cache__[key] = super().__call__(key, *args, **kwargs)
-        return cls.__cache__[key]
-
-
 class Agent:
     # Anonymous session
     __session__ = requests
     repeats = 1
 
     def exceptionDecorator(func):
-        def wrapper(*args, **kwargs):
+        def wrapper(self, *args, **kwargs):
             count = 0
             while True:
                 count += 1
                 try:
-                    return func(*args, **kwargs)
+                    return func(self, *args, **kwargs)
                 except Exception as e:
                     if count < Agent.repeats:
                         args, kwargs = self.exception_actions[e.__class__](e,
@@ -385,12 +366,14 @@ class Agent:
                 raise UnexpectedResponse(response.url, response.text)
         return comments_list
 
-    def __send_get_request__(self, *args, **kwargs):
+    def __send_get_request__(self, *args, raise_for_status=True, **kwargs):
         count = 0
         while True:
             count += 1
             try:
                 response = self.__session__.get(*args, **kwargs)
+                if raise_for_status:
+                    response.raise_for_status()
                 response.raise_for_status()
                 return response
             except Exception as e:
@@ -400,13 +383,14 @@ class Agent:
                 else:
                     raise InternetException(e)
 
-    def __send_post_request__(self, *args, **kwargs):
+    def __send_post_request__(self, *args, raise_for_status=True, **kwargs):
         count = 0
         while True:
             count += 1
             try:
                 response = self.__session__.post(*args, **kwargs)
-                response.raise_for_status()
+                if raise_for_status:
+                    response.raise_for_status()
                 return response
             except Exception as e:
                 if count < self.repeats:
@@ -417,10 +401,7 @@ class Agent:
 
 
 # Account class
-class Account(metaclass=ElementConstructor):
-    __cache__ = dict()
-    __primarykey__ = "login"
-
+class Account:
     def __init__(self, login):
         self.id = None
         self.login = login
@@ -465,7 +446,11 @@ class AgentAccount(Account, Agent):
         super().__init__(login)
         if not isinstance(settings, dict):
             raise TypeError("'settings' must be dict type")
-        # Request for get start page for get CSRFToken
+
+        self.__auth(password, settings)
+
+    def __auth(self, password, settings):
+
         response = self.__send_get_request__(
             "https://www.instagram.com/",
             **settings
@@ -485,13 +470,14 @@ class AgentAccount(Account, Agent):
             "https://www.instagram.com/accounts/login/ajax/",
             data=data,
             headers=headers,
+            raise_for_status=False,
             **settings,
         )
 
         # Parse response info
         try:
             data = response.json()
-            if not data['authenticated']:
+            if data['status'] == 'fail' or not data['authenticated']:
                 raise AuthException(self.login)
         except (ValueError, KeyError):
             raise UnexpectedResponse(response.url, response.text)
@@ -938,10 +924,7 @@ class AgentAccount(Account, Agent):
         return response
 
 
-class Media(metaclass=ElementConstructor):
-    __cache__ = {}
-    __primarykey__ = "code"
-
+class Media:
     def __init__(self, code):
         self.id = None
         self.code = str(code)
@@ -984,10 +967,7 @@ class Media(metaclass=ElementConstructor):
         self.display_url = data['display_url']
 
 
-class Location(metaclass=ElementConstructor):
-    __cache__ = {}
-    __primarykey__ = "id"
-
+class Location:
     def __init__(self, id):
         self.id = str(id)
         self.slug = None
@@ -1014,10 +994,7 @@ class Location(metaclass=ElementConstructor):
             self.top_posts.add(Media(node['code']))
 
 
-class Tag(metaclass=ElementConstructor):
-    __cache__ = {}
-    __primarykey__ = "name"
-
+class Tag:
     def __init__(self, name):
         self.name = str(name)
         self.media_count = None
@@ -1033,10 +1010,7 @@ class Tag(metaclass=ElementConstructor):
             self.top_posts.add(Media(node['code']))
 
 
-class Comment(metaclass=ElementConstructor):
-    __cache__ = {}
-    __primarykey__ = "id"
-
+class Comment:
     def __init__(self, id, media, owner, text, data):
         self.id = str(id)
         self.media = media
