@@ -374,7 +374,6 @@ class Agent:
                 response = self.__session__.get(*args, **kwargs)
                 if raise_for_status:
                     response.raise_for_status()
-                response.raise_for_status()
                 return response
             except Exception as e:
                 if count < self.repeats:
