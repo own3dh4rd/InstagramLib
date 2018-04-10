@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='InstagramLib',
-    version='2018.3.1',
+    version='2018.4.1',
     author='OlegYurchik',
     packages=find_packages(),
     url='https://github.com/OlegYurchik/InstagramLib',
