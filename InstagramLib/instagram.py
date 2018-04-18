@@ -1,4 +1,7 @@
 #!/usr/bin/python3
+import hashlib
+import re
+import json
 
 import requests
 from requests.exceptions import *
@@ -99,7 +102,7 @@ class ExceptionTree:
 
 class Agent:
     # Anonymous session
-    __session__ = requests
+    __session__ = requests.Session()
     repeats = 1
 
     def exceptionDecorator(func):
@@ -129,19 +132,20 @@ class Agent:
     exception_actions[HTTPError] = __http_error_action__
 
     @exceptionDecorator
-    def update(self, obj, settings={}):
+    def __update__(self, obj=None, settings={}):
         # Checks and set data
         if not isinstance(settings, dict):
             raise TypeError("'settings' must be dict type")
+
         if isinstance(obj, Account):
-            query = "https://www.instagram.com/{0}/?__a=1".format(obj.login)
+            query = "https://www.instagram.com/{0}".format(obj.login)
         elif isinstance(obj, Media):
-            query = "https://www.instagram.com/p/{0}?__a=1".format(obj.code)
+            query = "https://www.instagram.com/p/{0}".format(obj.code)
         elif isinstance(obj, Location):
-            query = "https://www.instagram.com/explore/locations/{0}/?__a=1".format(
+            query = "https://www.instagram.com/explore/locations/{0}".format(
                 obj.id)
         elif isinstance(obj, Tag):
-            query = "https://www.instagram.com/explore/tags/{0}/?__a=1".format(
+            query = "https://www.instagram.com/explore/tags/{0}".format(
                 obj.name)
         else:
             raise TypeError("obj must be Account, Media, Location or Tag")
@@ -151,47 +155,109 @@ class Agent:
 
         # Parsing info
         try:
-            obj.__setDataFromJSON__(response.json())
-        except (ValueError, KeyError):
+            match = re.search(
+                r"<script[^>]*>\s*window._sharedData\s*=\s*((?!<script>).*)\s*;\s*</script>",
+                response.text,
+            )
+            data = json.loads(match.group(1))
+            if 'rhx_gis' in data:
+                self.rhx_gis = data['rhx_gis']
+            if 'csrf_token' in data['config']:
+                self.csrf_token = data['config']['csrf_token']
+            data = data['entry_data']
+            if isinstance(obj, Account):
+                data = data['ProfilePage'][0]['graphql']['user']
+            elif isinstance(obj, Media):
+                data = data['PostPage'][0]['graphql']['shortcode_media']
+            elif isinstance(obj, Location):
+                data = data['LocationsPage'][0]['graphql']['location']
+            elif isinstance(obj, Tag):
+                data = data['TagPage'][0]['graphql']['hashtag']
+            obj.__setDataFromJSON__(data)
+            return data
+        except (AttributeError, KeyError, ValueError):
             raise UnexpectedResponse(response.url, response.text)
 
     @exceptionDecorator
-    def getMedia(self, obj, count=12, settings={}):
-        # Checks data
-        if not isinstance(settings, dict):
-            raise TypeError("'settings' must be dict type")
+    def getMedia(self, obj, after=None, count=12, settings={},
+                 limit=12):
+        # Check data
         if not isinstance(count, int):
             raise TypeError("'count' must be int type")
-        if isinstance(obj, Account):
-            if obj.id == None:
-                raise NotUpdatedElement(obj, 'id')
-            data = {'query_id': 17888483320059182,
-                    'variables': '{"id": ' + str(obj.id) + ', "first": ' + str(
-                        count) + '}'}
-        elif isinstance(obj, Location):
-            if obj.id == None:
-                raise NotUpdatedElement(obj, 'id')
-            data = {'query_id': 17865274345132052,
-                    'variables': '{"id": ' + str(obj.id) + ', "first": ' + str(
-                        count) + '}'}
-        elif isinstance(obj, Tag):
-            if obj.name == None:
-                raise NotUpdatedElement(obj, 'name')
-            data = {'query_id': 17875800862117404,
-                    'variables': '{"tag_name": "' + obj.name + '", "first": ' + str(
-                        count) + '}'}
-        else:
-            raise TypeError("'obj' must be Account type")
 
-        # Set data
-        if 'params' in settings:
-            settings['params'].update(data)
-        else:
-            settings['params'] = data
+        data = self.__update__(obj, settings)
         media_list = []
         stop = False
 
+        # Parse first request
+        if not after:
+            try:
+                if not isinstance(settings, dict):
+                    raise TypeError("'settings' must be dict type")
+                if isinstance(obj, Account):
+                    data = data['edge_owner_to_timeline_media']
+                elif isinstance(obj, Tag):
+                    data = data['edge_location_to_media']
+                elif isinstance(obj, Location):
+                    data = data['edge_hashtag_to_media']
+                else:
+                    raise TypeError(
+                        "obj must be Account, Media, Location or Tag")
+                for media in data['edges']:
+                    media = media['node']
+                    m = Media(media['shortcode'])
+                    m.__setDataFromJSON__(media)
+                    if isinstance(obj, Account):
+                        m.likes_count = media['edge_media_preview_like'][
+                            'count']
+                        m.owner = obj
+                    else:
+                        m.likes_count = media['edge_liked_by']
+                    obj.media.add(m)
+                    media_list.append(m)
+                if len(data['edges']) < count and data['page_info'][
+                    'has_next_page']:
+                    count = count - len(data['edges'])
+                else:
+                    stop = True
+                if data['page_info']['has_next_page']:
+                    after = data['page_info']['end_cursor']
+                else:
+                    after = None
+            except (ValueError, KeyError):
+                raise UnexpectedResponse(response.url, response.text)
+
+        # Set params
+        if not 'params' in settings:
+            settings['params'] = {
+                'query_hash': "42323d64886122307be10013ad2dcc44",
+            }
+
         while not stop:
+            # Set params
+            data = {'after': after}
+            if limit < count:
+                data['first'] = limit
+            else:
+                data['first'] = count
+            if isinstance(obj, Tag):
+                data['name'] = 'tag_name'
+                data['name_value'] = obj.name
+            else:
+                data['name'] = 'id'
+                data['name_value'] = obj.id
+            settings['params'][
+                'variables'] = '{{"{name}":"{name_value}","first":{first},"after":"{after}"}}'.format(
+                **data)
+            # Set GIS header
+            settings['headers'] = {
+                'X-Instagram-GIS': hashlib.md5('{0}:{1}:{2}'.format(
+                    self.rhx_gis,
+                    self.csrf_token,
+                    settings['params']['variables'],
+                ).encode('utf-8')).hexdigest(),
+            }
+
             # Send request
             response = self.__send_get_request__(
                 "https://www.instagram.com/graphql/query/",
@@ -210,54 +276,61 @@ class Agent:
                     data = response.json()['data']['hashtag'][
                         'edge_hashtag_to_media']
                 for media in data['edges']:
-                    m = Media(media['node']['shortcode'])
-                    m.id = media['node']['id']
-                    if media['node']['edge_media_to_caption']['edges']:
-                        m.caption = \
-                        media['node']['edge_media_to_caption']['edges'][0][
-                            'node']['text']
+                    media = media['node']
+                    m = Media(media['shortcode'])
+                    m.__setDataFromJSON__(media)
                     if isinstance(obj, Account):
+                        m.likes_count = media['edge_media_preview_like'][
+                            'count']
                         m.owner = obj
-                    m.date = media['node']['taken_at_timestamp']
-                    if 'location' in media['node']:
-                        m.location = Location(media['node']['location']['id'])
-                    if isinstance(obj, Location):
-                        m.location = obj
-                    if isinstance(obj, Account):
-                        m.likes_count = \
-                        media['node']['edge_media_preview_like']['count']
                     else:
-                        m.likes_count = media['node']['edge_liked_by']
-                    m.comments_count = media['node']['edge_media_to_comment'][
-                        'count']
-                    m.comments_disabled = media['node']['comments_disabled']
-                    m.is_video = media['node']['is_video']
-                    m.display_url = media['node']['display_url']
-                    m.dimensions = (media['node']['dimensions']['width'],
-                                    media['node']['dimensions']['height'])
+                        m.likes_count = media['edge_liked_by']
                     obj.media.add(m)
                     media_list.append(m)
                 if len(data['edges']) < count and data['page_info'][
                     'has_next_page']:
                     count = count - len(data['edges'])
-                    if isinstance(obj, Tag):
-                        settings['params'][
-                            'variables'] = '{"tag_name": "' + obj.name + '", "first": ' + str(
-                            count) + ', "after": "' + data['page_info'][
-                                               'end_cursor'] + '"}'
-                    else:
-                        settings['params']['variables'] = '{"id": ' + str(
-                            obj.id) + ', "first": ' + str(
-                            count) + ', "after": "' + data['page_info'][
-                                                              'end_cursor'] + '"}'
                 else:
                     stop = True
+                if data['page_info']['has_next_page']:
+                    after = data['page_info']['end_cursor']
+                else:
+                    after = None
             except (ValueError, KeyError):
                 raise UnexpectedResponse(response.url, response.text)
-        return media_list
+        return media_list, after
 
     @exceptionDecorator
-    def getLikes(self, media, count=20, settings={}):
+    def getLikes(self, media, settings={}):
+        # Check data
+        if not isinstance(settings, dict):
+            raise TypeError("'settings' must be dict type")
+        if not isinstance(media, Media):
+            raise TypeError("'media' must be Media type")
+
+        data = self.__update__(media, settings)
+        likes_list = []
+        # Parse first request
+        try:
+            data = data['edge_media_preview_like']
+            for edge in data['edges']:
+                edge = edge['node']
+                account = Account(edge['username'])
+                account.id = edge['id']
+                account.profile_pic_url = edge['profile_pic_url']
+                if 'is_verified' in edge:
+                    account.is_verified = edge['is_verified']
+                if 'full_name' in edge:
+                    account.full_name = edge['full_name']
+                media.likes.add(account)
+                likes_list.append(account)
+        except (ValueError, KeyError):
+            raise UnexpectedResponse(response.url, response.text)
+        return likes_list, None
+
+    @exceptionDecorator
+    def getComments(self, media, after=None, count=35, settings={},
+                    limit=1000):
         # Check data
         if not isinstance(settings, dict):
             raise TypeError("'settings' must be dict type")
@@ -266,72 +339,57 @@ class Agent:
         if not isinstance(media, Media):
             raise TypeError("'media' must be Media type")
 
-        # Set data
-        data = {'query_id': 17864450716183058,
-                "variables": '{"shortcode": "' + media.code + '", "first": ' + str(
-                    count) + '}'}
-        if 'params' in settings:
-            settings['params'].update(data)
-        else:
-            settings['params'] = data
-        likes_list = []
-        stop = False
+        data = self.__update__(media, settings)
+        comments_list = []
 
-        while not stop:
-            # Request for get info
-            response = self.__send_get_request__(
-                "https://www.instagram.com/graphql/query/",
-                **settings,
-            )
-
-            # Parsing info
+        if not after:
             try:
-                data = response.json()['data']['shortcode_media'][
-                    'edge_liked_by']
-                media.likes_count = data['count']
-                for edge in data['edges']:
-                    account = Account(edge['node']['username'])
-                    account.id = edge['node']['id']
-                    account.profile_pic_url = edge['node']['profile_pic_url']
-                    account.is_verified = edge['node']['is_verified']
-                    account.full_name = edge['node']['full_name']
-                    media.likes.add(account)
-                    likes_list.append(account)
+                data = data['edge_media_to_comment']
+                for comment in data['edges']:
+                    comment = comment['node']
+                    c = Comment(
+                        comment['id'],
+                        media=media,
+                        owner=Account(comment['owner']['username']),
+                        text=comment['text'],
+                        created_at=comment['created_at'],
+                    )
+                    media.comments.add(c)
+                    comments_list.append(c)
                 if len(data['edges']) < count and data['page_info'][
                     'has_next_page']:
                     count = count - len(data['edges'])
-                    settings['params'][
-                        'variables'] = '{"shortcode": "' + media.code + '", "first": ' + str(
-                        count) + ', "after": "' + data['page_info'][
-                                           'end_cursor'] + '"}'
+                    after = data['page_info']['end_cursor']
                 else:
                     stop = True
             except (ValueError, KeyError):
                 raise UnexpectedResponse(response.url, response.text)
-        return likes_list
 
-    @exceptionDecorator
-    def getComments(self, media, count=20, settings={}):
-        # Check data
-        if not isinstance(settings, dict):
-            raise TypeError("'settings' must be dict type")
-        if not isinstance(count, int):
-            raise TypeError("'count' must be int type")
-        if not isinstance(media, Media):
-            raise TypeError("'media' must be Media type")
-
-        # Set data
-        data = {'query_id': 17852405266163336,
-                'variables': '{"shortcode": "' + media.code + '", "first": ' + str(
-                    count) + '}'}
-        if 'params' in settings:
-            settings['params'].update(data)
-        else:
-            settings['params'] = data
-        comments_list = []
-        stop = False
+        # Set params
+        if not 'params' in settings:
+            settings['params'] = {
+                'query_hash': "33ba35852cb50da46f5b5e889df7d159",
+            }
 
         while not stop:
+            # Set params
+            data = {'after': after, 'code': media.code}
+            if limit < count:
+                data['first'] = limit
+            else:
+                data['first'] = count
+            settings['params']['variables'] = \
+                '{{"shortcode":"{code}","first":{first},"after":"{after}"}}'.format(
+                    **data)
+            # Set GIS header
+            settings['headers'] = {
+                'X-Instagram-GIS': hashlib.md5('{0}:{1}:{2}'.format(
+                    self.rhx_gis,
+                    self.csrf_token,
+                    settings['params']['variables'],
+                ).encode('utf-8')).hexdigest(),
+            }
+
             # Request for get info
             response = self.__send_get_request__(
                 "https://www.instagram.com/graphql/query/",
@@ -343,28 +401,29 @@ class Agent:
                 data = response.json()['data']['shortcode_media'][
                     'edge_media_to_comment']
                 media.comments_count = data['count']
-                for edge in data['edges']:
-                    comment = Comment(
-                        edge['node']['id'],
+                for comment in data['edges']:
+                    comment = comment['node']
+                    c = Comment(
+                        id=comment['id'],
                         media=media,
-                        owner=Account(edge['node']['owner']['username']),
-                        text=edge['node']['text'],
-                        data=edge['node']['created_at'],
+                        owner=Account(comment['owner']['username']),
+                        text=comment['text'],
+                        data=comment['created_at'],
                     )
-                    media.comments.add(comment)
-                    comments_list.append(comment)
+                    media.comments.add(c)
+                    comments_list.append(c)
                 if len(data['edges']) < count and data['page_info'][
                     'has_next_page']:
                     count = count - len(data['edges'])
-                    settings['params'][
-                        'variables'] = '{"shortcode": "' + media.code + '", "first": ' + str(
-                        count) + ', "after": "' + data['page_info'][
-                                           'end_cursor'] + '"}'
                 else:
                     stop = True
+                if data['page_info']['has_next_page']:
+                    after = data['page_info']['end_cursor']
+                else:
+                    after = None
             except (ValueError, KeyError):
                 raise UnexpectedResponse(response.url, response.text)
-        return comments_list
+        return comments_list, after
 
     def __send_get_request__(self, *args, raise_for_status=True, **kwargs):
         count = 0
@@ -421,7 +480,6 @@ class Account:
         self.followers = set()
 
     def __setDataFromJSON__(self, data):
-        data = data['graphql']['user']
         self.id = data['id']
         self.full_name = data['full_name']
         self.profile_pic_url = data['profile_pic_url']
@@ -437,19 +495,12 @@ class Account:
 
 
 class AgentAccount(Account, Agent):
-    # Session for user
-    __session__ = requests.Session()
-
     @Agent.exceptionDecorator
     def __init__(self, login, password, settings={}):
         super().__init__(login)
         if not isinstance(settings, dict):
             raise TypeError("'settings' must be dict type")
-
-        self.__auth(password, settings)
-
-    def __auth(self, password, settings):
-
+        # Request for get start page for get CSRFToken
         response = self.__send_get_request__(
             "https://www.instagram.com/",
             **settings
@@ -469,7 +520,6 @@ class AgentAccount(Account, Agent):
             "https://www.instagram.com/accounts/login/ajax/",
             data=data,
             headers=headers,
-            raise_for_status=False,
             **settings,
         )
 
@@ -481,10 +531,229 @@ class AgentAccount(Account, Agent):
         except (ValueError, KeyError):
             raise UnexpectedResponse(response.url, response.text)
 
-    def update(self, obj=None, settings={}):
-        if not obj:
-            obj = self
-        return super().update(obj, settings)
+    @Agent.exceptionDecorator
+    def getMedia(self, obj, after=None, count=12, settings={},
+                 limit=1000):
+        return super().getMedia(obj, after, count, settings, limit)
+
+    @Agent.exceptionDecorator
+    def getLikes(self, media, after=None, count=20, settings={},
+                 limit=1000):
+        # Check data
+        if not isinstance(media, Media):
+            raise TypeError("'media' must be Media type")
+        if not isinstance(count, int):
+            raise TypeError("'count' must be int type")
+        if not isinstance(settings, dict):
+            raise TypeError("'settings' must be dict type")
+        if not isinstance(limit, int):
+            raise TypeError("'limit' must be int type")
+
+        # Update media
+        self.__update__(media, settings)
+        likes_list = []
+        stop = False
+
+        # Set data
+        # Set params
+        if not 'params' in settings:
+            settings['params'] = {
+                'query_hash': "1cb6ec562846122743b61e492c85999f",
+                'variables': '{{"shortcode":"{shortcode}","first":{first}}}',
+            }
+
+        while not stop:
+            data = {}
+            if after:
+                data['after'] = after
+
+            if limit < count:
+                data['first'] = limit
+            else:
+                data['first'] = count
+            data['shortcode'] = media.code
+            settings['params']['variables'] = \
+                settings['params']['variables'].format(**data)
+
+            # Request for get info
+            response = self.__send_get_request__(
+                "https://www.instagram.com/graphql/query/",
+                **settings,
+            )
+
+            # Parsing info
+            try:
+                data = response.json()['data']['shortcode_media'][
+                    'edge_liked_by']
+                media.likes_count = data['count']
+                for edge in data['edges']:
+                    account = Account(edge['node']['username'])
+                    account.id = edge['node']['id']
+                    account.profile_pic_url = edge['node']['profile_pic_url']
+                    account.is_verified = edge['node']['is_verified']
+                    account.full_name = edge['node']['full_name']
+                    media.likes.add(account)
+                    likes_list.append(account)
+                if len(data['edges']) < count and data['page_info'][
+                    'has_next_page']:
+                    count = count - len(data['edges'])
+                    settings['params']['variables'] = \
+                        '{{"shortcode":"{shortcode}","first":{first},"after":"{after}"}}'
+                else:
+                    stop = True
+                if data['page_info']['has_next_page']:
+                    after = data['page_info']['end_cursor']
+                else:
+                    after = None
+            except (ValueError, KeyError):
+                raise UnexpectedResponse(response.url, response.text)
+
+        return likes_list, after
+
+    @Agent.exceptionDecorator
+    def getFollows(self, account=None, after=None, count=20, settings={},
+                   limit=1000):
+        # Check set and data
+        if not account:
+            account = self
+        if not isinstance(settings, dict):
+            raise TypeError("'settings' must be dict type")
+        if not isinstance(count, int):
+            raise TypeError("'count' must be int type")
+        if not isinstance(account, Account):
+            raise TypeError("'account' must be Account type")
+
+        # Update account
+        self.__update__(account, settings)
+        follows_list = []
+        stop = False
+
+        # Set data
+        # Set params
+        if not 'params' in settings:
+            settings['params'] = {
+                'query_hash': "58712303d941c6855d4e888c5f0cd22f",
+                'variables': '{{"id":"{id}","first":{first}}}',
+            }
+
+        while not stop:
+            data = {}
+            if after:
+                data['after'] = after
+            if limit < count:
+                data['first'] = limit
+            else:
+                data['first'] = count
+            data['id'] = account.id
+            settings['params']['variables'] = \
+                settings['params']['variables'].format(**data)
+
+            # Request for get info
+            response = self.__send_get_request__(
+                "https://www.instagram.com/graphql/query/",
+                **settings,
+            )
+
+            # Parsing info
+            try:
+                data = response.json()['data']['user']['edge_follow']
+                account.follows_count = data['count']
+                for follow in data['edges']:
+                    follow = follow['node']
+                    a = Account(follow['username'])
+                    a.id = follow['id']
+                    a.profile_pic_url = follow['profile_pic_url']
+                    a.is_verified = follow['is_verified']
+                    a.full_name = follow['full_name']
+                    account.follows.add(a)
+                    follows_list.append(a)
+                if len(data['edges']) < count and data['page_info'][
+                    'has_next_page']:
+                    count = count - len(data['edges'])
+                    settings['params']['variables'] = \
+                        '{{"id":"{id}","first":{first},"after":"{after}"}}'
+                else:
+                    stop = True
+                if data['page_info']['has_next_page']:
+                    after = data['page_info']['end_cursor']
+                else:
+                    after = None
+            except (ValueError, KeyError):
+                raise UnexpectedResponse(response.url, response.text)
+
+        return follows_list, after
+
+    @Agent.exceptionDecorator
+    def getFollowers(self, account=None, after=None, count=20,
+                     settings={}, limit=1000):
+        # Check set and data
+        if not account:
+            account = self
+        if not isinstance(settings, dict):
+            raise TypeError("'settings' must be dict type")
+        if not isinstance(count, int):
+            raise TypeError("'count' must be int type")
+        if not isinstance(account, Account):
+            raise TypeError("'account' must be Account type")
+
+        # Update account
+        self.__update__(account, settings)
+        followers_list = []
+        stop = False
+
+        # Set data
+        # Set params
+        if not 'params' in settings:
+            settings['params'] = {
+                'query_hash': "37479f2b8209594dde7facb0d904896a",
+                'variables': '{{"id":"{id}","first":{first}}}',
+            }
+
+        while not stop:
+            data = {}
+            if after:
+                data['after'] = after
+            if limit < count:
+                data['first'] = limit
+            else:
+                data['first'] = count
+            data['id'] = account.id
+            settings['params']['variables'] = \
+                settings['params']['variables'].format(**data)
+
+            # Request for get info
+            response = self.__send_get_request__(
+                "https://www.instagram.com/graphql/query/",
+                **settings,
+            )
+
+            # Parsing info
+            try:
+                data = response.json()['data']['user']['edge_followed_by']
+                account.followers_count = data['count']
+                for follower in data['edges']:
+                    follower = follower['node']
+                    a = Account(follower['username'])
+                    a.id = follower['id']
+                    a.profile_pic_url = follower['profile_pic_url']
+                    a.is_verified = follower['is_verified']
+                    a.full_name = follower['full_name']
+                    account.followers.add(a)
+                    followers_list.append(a)
+                if len(data['edges']) < count and data['page_info'][
+                    'has_next_page']:
+                    count = count - len(data['edges'])
+                    settings['params']['variables'] = \
+                        '{{"id":"{id}","first":{first},"after":"{after}"}}'
+                else:
+                    stop = True
+                if data['page_info']['has_next_page']:
+                    after = data['page_info']['end_cursor']
+                else:
+                    after = None
+            except (ValueError, KeyError):
+                raise UnexpectedResponse(response.url, response.text)
+        return followers_list, after
 
     def feed(self, count=12, settings={}):
         # Check set and data
@@ -514,7 +783,8 @@ class AgentAccount(Account, Agent):
                 media.id = int(edge['id'])
                 if edge['edge_media_to_caption']['edges']:
                     media.caption = \
-                    edge['edge_media_to_caption']['edges'][0]['node']['text']
+                        edge['edge_media_to_caption']['edges'][0]['node'][
+                            'text']
                 media.owner = Account(edge['owner']['username'])
                 media.owner.id = int(edge['owner']['id'])
                 media.owner.full_name = edge['owner']['full_name']
@@ -531,7 +801,7 @@ class AgentAccount(Account, Agent):
                     media.video_url = edge['video_url']
                 media.display_url = edge['display_url']
                 media.dimensions = (
-                edge['dimensions']['width'], edge['dimensions']['height'])
+                    edge['dimensions']['width'], edge['dimensions']['height'])
                 feed.append(media)
         except (ValueError, KeyError):
             raise UnexpectedResponse(response.url, response.text)
@@ -564,8 +834,8 @@ class AgentAccount(Account, Agent):
                     media.id = int(edge['id'])
                     if edge['edge_media_to_caption']['edges']:
                         media.caption = \
-                        edge['edge_media_to_caption']['edges'][0]['node'][
-                            'text']
+                            edge['edge_media_to_caption']['edges'][0]['node'][
+                                'text']
                     media.owner = Account(edge['owner']['username'])
                     media.owner.id = int(edge['owner']['id'])
                     media.owner.full_name = edge['owner']['full_name']
@@ -584,7 +854,8 @@ class AgentAccount(Account, Agent):
                         media.video_url = edge['video_url']
                     media.display_url = edge['display_url']
                     media.dimensions = (
-                    edge['dimensions']['width'], edge['dimensions']['height'])
+                        edge['dimensions']['width'],
+                        edge['dimensions']['height'])
                     feed.append(media)
                 # Recursive calling method if not all elements was loading
                 if len(data['edges']) < count and data['page_info'][
@@ -600,127 +871,6 @@ class AgentAccount(Account, Agent):
             except (ValueError, KeyError):
                 raise UnexpectedResponse(response.url, response.text)
         return feed
-
-    def getMedia(self, obj=None, count=12, settings={}):
-        if not obj:
-            obj = self
-        return super().getMedia(obj, count, settings)
-
-    @Agent.exceptionDecorator
-    def getFollows(self, account=None, count=20, settings={}):
-        # Check set and data
-        if not account:
-            account = self
-        if not isinstance(settings, dict):
-            raise TypeError("'settings' must be dict type")
-        if not isinstance(count, int):
-            raise TypeError("'count' must be int type")
-        if not isinstance(account, Account):
-            raise TypeError("'account' must be Account type")
-        if account.id == None:
-            raise NotUpdatedElement(account, 'id')
-
-        # Set data
-        data = {"query_id": 17874545323001329,
-                'variables': '{"id": ' + str(account.id) + ', "first": ' + str(
-                    count) + '}'}
-        if 'params' in settings:
-            settings['params'].update(data)
-        else:
-            settings['params'] = data
-        follows_list = []
-        stop = False
-
-        while not stop:
-            # Request for get info
-            response = self.__send_get_request__(
-                "https://www.instagram.com/graphql/query/",
-                **settings,
-            )
-
-            # Parsing info
-            try:
-                data = response.json()['data']['user']['edge_follow']
-                account.follows_count = data['count']
-                for edge in data['edges']:
-                    a = Account(edge['node']['username'])
-                    a.id = edge['node']['id']
-                    a.profile_pic_url = edge['node']['profile_pic_url']
-                    a.is_verified = edge['node']['is_verified']
-                    a.full_name = edge['node']['full_name']
-                    account.follows.add(a)
-                    follows_list.append(a)
-                # Recursive calling method if not all elements was loading
-                if len(data['edges']) < count and data['page_info'][
-                    'has_next_page']:
-                    count = count - len(data['edges'])
-                    settings['params']['variables'] = '{"id": ' + str(
-                        account.id) + ', "first": ' + str(
-                        count) + ', "after": "' + data['page_info'][
-                                                          'end_cursor'] + '"}'
-                else:
-                    stop = True
-            except (ValueError, KeyError):
-                raise UnexpectedResponse(response.url, response.text)
-        return follows_list
-
-    @Agent.exceptionDecorator
-    def getFollowers(self, account=None, count=20, settings={}):
-        # Check data
-        if not account:
-            account = self
-        if not isinstance(settings, dict):
-            raise TypeError("'settings' must be dict type")
-        if not isinstance(count, int):
-            raise TypeError("'count' must be int type")
-        if not isinstance(account, Account):
-            raise TypeError("'account' must be Account type")
-        if account.id == None:
-            raise NotUpdatedElement(account, 'id')
-
-        # Set data
-        data = {'query_id': 17851374694183129,
-                'variables': '{"id": ' + str(account.id) + ', "first": ' + str(
-                    count) + '}'}
-        if 'params' in settings:
-            settings['params'].update(data)
-        else:
-            settings['params'] = data
-        followers_list = []
-        stop = False
-
-        while not stop:
-            # Request for get info
-            response = self.__send_get_request__(
-                "https://www.instagram.com/graphql/query/",
-                **settings,
-            )
-
-            # Parsing info
-            try:
-                data = response.json()['data']['user']['edge_followed_by']
-                account.followers_count = data['count']
-                for edge in data['edges']:
-                    a = Account(edge['node']['username'])
-                    a.id = edge['node']['id']
-                    a.profile_pic_url = edge['node']['profile_pic_url']
-                    a.is_verified = edge['node']['is_verified']
-                    a.full_name = edge['node']['full_name']
-                    account.followers.add(a)
-                    followers_list.append(a)
-                # Recursive calling method if not all elements was loading
-                if len(data['edges']) < count and data['page_info'][
-                    'has_next_page']:
-                    count = count - len(data['edges'])
-                    settings['params']['variables'] = '{"id": ' + str(
-                        account.id) + ', "first": ' + str(
-                        count) + ', "after": "' + data['page_info'][
-                                                          'end_cursor'] + '"}'
-                else:
-                    stop = True
-            except (ValueError, KeyError):
-                raise UnexpectedResponse(response.url, response.text)
-        return followers_list
 
     @Agent.exceptionDecorator
     def like(self, media, settings={}):
@@ -926,7 +1076,7 @@ class AgentAccount(Account, Agent):
 class Media:
     def __init__(self, code):
         self.id = None
-        self.code = str(code)
+        self.code = code
         self.caption = None
         self.owner = None
         self.date = None
@@ -944,7 +1094,6 @@ class Media:
         self.comments = set()
 
     def __setDataFromJSON__(self, data):
-        data = data['graphql']['shortcode_media']
         self.id = data['id']
         self.code = data['shortcode']
         if data['edge_media_to_caption']['edges']:
@@ -952,23 +1101,25 @@ class Media:
                 'text']
         else:
             self.caption = None
-        self.owner = Account(data['owner']['username'])
+        if 'username' in data['owner']:
+            self.owner = Account(data['owner']['username'])
         self.date = data['taken_at_timestamp']
-        if data['location']:
+        if 'location' in data and data['location'] and 'id' in data['location']:
             self.location = Location(data['location']['id'])
         self.likes_count = data['edge_media_preview_like']['count']
         self.comments_count = data['edge_media_to_comment']['count']
         self.comments_disabled = data['comments_disabled']
         self.is_video = data['is_video']
-        if self.is_video:
+        if self.is_video and 'video_url' in data:
             self.video_url = data['video_url']
-        self.is_ad = data['is_ad']
+        if 'is_ad' in data:
+            self.is_ad = data['is_ad']
         self.display_url = data['display_url']
 
 
 class Location:
     def __init__(self, id):
-        self.id = str(id)
+        self.id = id
         self.slug = None
         self.name = None
         self.has_public_page = None
@@ -980,7 +1131,6 @@ class Location:
         self.top_posts = set()
 
     def __setDataFromJSON__(self, data):
-        data = data['location']
         self.id = data['id']
         self.slug = data['slug']
         self.name = data['name']
@@ -988,31 +1138,30 @@ class Location:
         if 'directory' in data:
             self.directory = data['directory']
         self.coordinates = (data['lat'], data['lng'])
-        self.media_count = data['media']['count']
-        for node in data['top_posts']['nodes']:
-            self.top_posts.add(Media(node['code']))
+        self.media_count = data['edge_location_to_media']['count']
+        for node in data['edge_location_to_top_posts']['edges']:
+            self.top_posts.add(Media(node['node']['shortcode']))
 
 
 class Tag:
     def __init__(self, name):
-        self.name = str(name)
+        self.name = name
         self.media_count = None
         # Lists
         self.media = set()
         self.top_posts = set()
 
     def __setDataFromJSON__(self, data):
-        data = data['tag']
         self.name = data['name']
-        self.media_count = data['media']['count']
-        for node in data['top_posts']['nodes']:
-            self.top_posts.add(Media(node['code']))
+        self.media_count = data['edge_hashtag_to_media']['count']
+        for node in data['edge_hashtag_to_top_posts']['edges']:
+            self.top_posts.add(Media(node['node']['shortcode']))
 
 
 class Comment:
-    def __init__(self, id, media, owner, text, data):
-        self.id = str(id)
+    def __init__(self, id, media, owner, text, created_at):
+        self.id = id
         self.media = media
         self.owner = owner
         self.text = text
-        self.data = data
+        self.created_at = created_at
